@@ -34,6 +34,9 @@ from llava.train.llava_trainer import LLaVATrainer
 from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import tokenizer_image_token
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from tokenselector import init_token_selector,load_token_selector, LLaVATokenSelectorTrainer
 
 from PIL import Image
 
@@ -52,6 +55,8 @@ IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= versio
 
 @dataclass
 class ModelArguments:
+    mode: int = 1
+    k: int = 64
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
     version: Optional[str] = field(default="v0")
     freeze_backbone: bool = field(default=False)
@@ -78,6 +83,10 @@ class DataArguments:
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
+    alpha_pg_loss: float = 1.0
+    lambda_r: float = 0.1
+    sample_num: int = 10
+    tokenselector_bin_path: Optional[str] = field(default=None)
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
     remove_unused_columns: bool = field(default=False)
@@ -694,7 +703,8 @@ class LazySupervisedDataset(Dataset):
         if isinstance(i, int):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
-        if 'image' in sources[0]:
+        has_image=('image' in self.list_data_dict[i] and self.list_data_dict[i]['image'] is not None)
+        if has_image:
             image_file = self.list_data_dict[i]['image']
             image_folder = self.data_args.image_folder
             processor = self.data_args.image_processor
@@ -724,13 +734,13 @@ class LazySupervisedDataset(Dataset):
         data_dict = preprocess(
             sources,
             self.tokenizer,
-            has_image=('image' in self.list_data_dict[i]))
+            has_image=has_image)
         if isinstance(i, int):
             data_dict = dict(input_ids=data_dict["input_ids"][0],
                              labels=data_dict["labels"][0])
 
         # image exist in the data
-        if 'image' in self.list_data_dict[i]:
+        if has_image:
             data_dict['image'] = image
         elif self.data_args.is_multimodal:
             # image does not exist in the data, but the model is multimodal
@@ -785,7 +795,7 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                 data_collator=data_collator)
 
 
-def train(attn_implementation=None):
+def train(attn_implementation=None, token_selector=False):
     global local_rank
 
     parser = transformers.HfArgumentParser(
@@ -831,6 +841,12 @@ def train(attn_implementation=None):
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
                 **bnb_model_from_pretrained_args
             )
+            if token_selector:
+                mode = model_args.mode
+                k = model_args.k
+                init_token_selector(model, mode=mode, k=k)
+                if training_args.tokenselector_bin_path is not None:
+                    load_token_selector(model, training_args.tokenselector_bin_path)
     else:
         model = transformers.LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
@@ -958,15 +974,37 @@ def train(attn_implementation=None):
 
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
-    trainer = LLaVATrainer(model=model,
-                    tokenizer=tokenizer,
-                    args=training_args,
-                    **data_module)
-
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
+    if token_selector:
+        data_module['eval_dataset'] = data_module['train_dataset']
+        model.model.requires_grad_(False)
+        model.lm_head.requires_grad_(False)
+        model.model.token_selector.requires_grad_(True)
+        trainer = LLaVATokenSelectorTrainer(model=model,
+                        tokenizer=tokenizer,
+                        args=training_args,
+                        **data_module)
     else:
-        trainer.train()
+        trainer = LLaVATrainer(model=model,
+                        tokenizer=tokenizer,
+                        args=training_args,
+                        **data_module)
+        
+    # --- print trainable parameters ---
+    if local_rank == 0: 
+        print("="*80)
+        print("Printing trainable parameters...")
+        trainable_param_names = []
+        
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                trainable_param_names.append(name)
+        
+        for name in trainable_param_names:
+            print(f"- {name}")
+        print("="*80)
+    # -----------------------------------
+    
+    trainer.train()
     trainer.save_state()
 
     model.config.use_cache = True

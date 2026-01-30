@@ -10,6 +10,7 @@ from llava.conversation import conv_templates, SeparatorStyle
 from llava.model.builder import load_pretrained_model
 from llava.utils import disable_torch_init
 from llava.mm_utils import tokenizer_image_token, process_images, get_model_name_from_path
+from transformers import AutoTokenizer
 
 from PIL import Image
 import math
@@ -26,18 +27,34 @@ def get_chunk(lst, n, k):
     return chunks[k]
 
 
-def eval_model(args):
+def eval_model(args, my_model=None):
     # Model
     disable_torch_init()
     model_path = os.path.expanduser(args.model_path)
     model_name = get_model_name_from_path(model_path)
-    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
+
+    if my_model is not None:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+        model = my_model
+        vision_tower = model.get_vision_tower()
+        image_processor = vision_tower.image_processor
+    else:
+        tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
+        if args.tokenselector_bin_path is not None:
+            import sys
+            sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+            from tokenselector import init_token_selector, load_token_selector
+            init_token_selector(model, mode=0, k=args.tokenselector_k)
+            load_token_selector(model, args.tokenselector_bin_path)
 
     questions = [json.loads(q) for q in open(os.path.expanduser(args.question_file), "r")]
+    if getattr(args, "eval_q_num", None):
+        questions = questions[:args.eval_q_num]
     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
     answers_file = os.path.expanduser(args.answers_file)
     os.makedirs(os.path.dirname(answers_file), exist_ok=True)
     ans_file = open(answers_file, "w")
+    model.eval()
     for line in tqdm(questions):
         idx = line["question_id"]
         image_file = line["image"]
@@ -61,7 +78,7 @@ def eval_model(args):
         with torch.inference_mode():
             output_ids = model.generate(
                 input_ids,
-                images=image_tensor.unsqueeze(0).half().cuda(),
+                images=image_tensor.unsqueeze(0).cuda().to(dtype=model.dtype),
                 image_sizes=[image.size],
                 do_sample=True if args.temperature > 0 else False,
                 temperature=args.temperature,
@@ -96,6 +113,8 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--num_beams", type=int, default=1)
+    parser.add_argument("--tokenselector-bin-path", type=str, default=None)
+    parser.add_argument("--tokenselector-k", type=int, default=64)
     args = parser.parse_args()
 
     eval_model(args)

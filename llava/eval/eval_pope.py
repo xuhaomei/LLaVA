@@ -2,9 +2,10 @@ import os
 import json
 import argparse
 
-def eval_pope(answers, label_file):
+def eval_pope(answers, label_file, eval_q_num=None):
     label_list = [json.loads(q)['label'] for q in open(label_file, 'r')]
-
+    if eval_q_num is not None:
+        label_list = label_list[:eval_q_num]
     for answer in answers:
         text = answer['text']
 
@@ -60,6 +61,7 @@ def eval_pope(answers, label_file):
     print('F1 score: {}'.format(f1))
     print('Yes ratio: {}'.format(yes_ratio))
     print('%.3f, %.3f, %.3f, %.3f, %.3f' % (f1, acc, precision, recall, yes_ratio) )
+    return acc
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

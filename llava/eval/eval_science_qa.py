@@ -35,10 +35,7 @@ def get_pred_idx(prediction, choices, options):
         return -1
         return random.choice(range(len(choices)))
 
-
-if __name__ == "__main__":
-    args = get_args()
-
+def eval_single_sqa(args):
     base_dir = args.base_dir
     split_indices = json.load(open(os.path.join(base_dir, "pid_splits.json")))[args.split]
     problems = json.load(open(os.path.join(base_dir, "problems.json")))
@@ -54,13 +51,9 @@ if __name__ == "__main__":
     sqa_results['results'] = {}
     sqa_results['outputs'] = {}
 
-    for prob_id, prob in split_problems.items():
-        if prob_id not in predictions:
-            pred = {'text': 'FAILED', 'prompt': 'Unknown'}
-            pred_text = 'FAILED'
-        else:
-            pred = predictions[prob_id]
-            pred_text = pred['text']
+    for prob_id, pred in predictions.items():
+        prob = split_problems[prob_id]
+        pred_text = pred['text']
 
         if pred_text in args.options:
             answer = pred_text
@@ -108,7 +101,15 @@ if __name__ == "__main__":
     sqa_results['correct'] = correct
     sqa_results['count'] = total
 
-    with open(args.output_file, 'w') as f:
-        json.dump(results, f, indent=2)
-    with open(args.output_result, 'w') as f:
-        json.dump(sqa_results, f, indent=2)
+    if getattr(args, "output_file", None):
+        with open(args.output_file, 'w') as f:
+            json.dump(results, f, indent=2)
+    if getattr(args, "output_result", None):
+        with open(args.output_result, 'w') as f:
+            json.dump(sqa_results, f, indent=2)
+    return sqa_results['acc']
+
+
+if __name__ == "__main__":
+    args = get_args()
+    eval_single_sqa(args)

@@ -9,9 +9,11 @@ dist
 *.log.*
 *.json
 *.jsonl
+*.out
 
 # Data
 !**/alpaca-data-conversation.json
+playground/
 
 # Editor
 .idea

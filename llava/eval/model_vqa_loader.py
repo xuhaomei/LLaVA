@@ -11,6 +11,7 @@ from llava.model.builder import load_pretrained_model
 from llava.utils import disable_torch_init
 from llava.mm_utils import tokenizer_image_token, process_images, get_model_name_from_path
 from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer
 
 from PIL import Image
 import math
@@ -29,12 +30,13 @@ def get_chunk(lst, n, k):
 
 # Custom dataset class
 class CustomDataset(Dataset):
-    def __init__(self, questions, image_folder, tokenizer, image_processor, model_config):
+    def __init__(self, questions, image_folder, tokenizer, image_processor, model_config, conv_mode):
         self.questions = questions
         self.image_folder = image_folder
         self.tokenizer = tokenizer
         self.image_processor = image_processor
         self.model_config = model_config
+        self.conv_mode = conv_mode
 
     def __getitem__(self, index):
         line = self.questions[index]
@@ -45,7 +47,7 @@ class CustomDataset(Dataset):
         else:
             qs = DEFAULT_IMAGE_TOKEN + '\n' + qs
 
-        conv = conv_templates[args.conv_mode].copy()
+        conv = conv_templates[self.conv_mode].copy()
         conv.append_message(conv.roles[0], qs)
         conv.append_message(conv.roles[1], None)
         prompt = conv.get_prompt()
@@ -69,21 +71,42 @@ def collate_fn(batch):
 
 
 # DataLoader
-def create_data_loader(questions, image_folder, tokenizer, image_processor, model_config, batch_size=1, num_workers=4):
+def create_data_loader(questions, image_folder, tokenizer, image_processor, model_config, batch_size=1, num_workers=4, conv_mode="vicuna_v1"):
     assert batch_size == 1, "batch_size must be 1"
-    dataset = CustomDataset(questions, image_folder, tokenizer, image_processor, model_config)
+    dataset = CustomDataset(questions, image_folder, tokenizer, image_processor, model_config, conv_mode=conv_mode)
     data_loader = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False, collate_fn=collate_fn)
     return data_loader
 
 
-def eval_model(args):
+def eval_model(args, my_model=None):
     # Model
     disable_torch_init()
     model_path = os.path.expanduser(args.model_path)
     model_name = get_model_name_from_path(model_path)
-    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
+
+    if my_model is not None:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+        model = my_model
+        vision_tower = model.get_vision_tower()
+        image_processor = vision_tower.image_processor
+    else:
+        tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
+        if args.tokenselector_bin_path is not None:
+            import sys
+            sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+            from tokenselector import init_token_selector, load_token_selector
+            init_token_selector(model, mode=0, k=args.tokenselector_k)
+            load_token_selector(model, args.tokenselector_bin_path)
+    if getattr(args, "flowcut", None):
+        from flowcut.flowcut import flowcut as fc
+        model = fc(model, target_num=64)
+    if getattr(args, "visionzip", None):
+        from visionzip import visionzip as vz
+        model = vz(model, dominant=54, contextual=10)
 
     questions = [json.loads(q) for q in open(os.path.expanduser(args.question_file), "r")]
+    if getattr(args, "eval_q_num", None):
+        questions = questions[:args.eval_q_num]
     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
     answers_file = os.path.expanduser(args.answers_file)
     os.makedirs(os.path.dirname(answers_file), exist_ok=True)
@@ -93,23 +116,25 @@ def eval_model(args):
         args.conv_mode = args.conv_mode + '_mmtag'
         print(f'It seems that this is a plain model, but it is not using a mmtag prompt, auto switching to {args.conv_mode}.')
 
-    data_loader = create_data_loader(questions, args.image_folder, tokenizer, image_processor, model.config)
+    data_loader = create_data_loader(questions, args.image_folder, tokenizer, image_processor, model.config, conv_mode=args.conv_mode)
 
+    device = model.device
+    model.eval()
     for (input_ids, image_tensor, image_sizes), line in tqdm(zip(data_loader, questions), total=len(questions)):
         idx = line["question_id"]
         cur_prompt = line["text"]
 
-        input_ids = input_ids.to(device='cuda', non_blocking=True)
+        input_ids = input_ids.to(device=device, non_blocking=True)
 
         with torch.inference_mode():
             output_ids = model.generate(
                 input_ids,
-                images=image_tensor.to(dtype=torch.float16, device='cuda', non_blocking=True),
+                images=image_tensor.to(dtype=model.dtype, device=device, non_blocking=True),
                 image_sizes=image_sizes,
-                do_sample=True if args.temperature > 0 else False,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                num_beams=args.num_beams,
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+                num_beams=1,
                 max_new_tokens=args.max_new_tokens,
                 use_cache=True)
 
@@ -127,11 +152,11 @@ def eval_model(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", type=str, default="facebook/opt-350m")
+    parser.add_argument("--model-path", type=str, default="liuhaotian/llava-v1.5-7b")
     parser.add_argument("--model-base", type=str, default=None)
-    parser.add_argument("--image-folder", type=str, default="")
-    parser.add_argument("--question-file", type=str, default="tables/question.jsonl")
-    parser.add_argument("--answers-file", type=str, default="answer.jsonl")
+    parser.add_argument("--image-folder", type=str, default="/home/weiliu/student/xhm/LLaVA/playground/data/eval/gqa/data/images")
+    parser.add_argument("--question-file", type=str, default="/home/weiliu/student/xhm/LLaVA/playground/data/eval/gqa/llava_gqa_testdev_balanced.jsonl")
+    parser.add_argument("--answers-file", type=str, default="/home/weiliu/student/xhm/LLaVA/playground/data/eval/gqa/answers/test_answers.jsonl")
     parser.add_argument("--conv-mode", type=str, default="llava_v1")
     parser.add_argument("--num-chunks", type=int, default=1)
     parser.add_argument("--chunk-idx", type=int, default=0)
@@ -139,6 +164,11 @@ if __name__ == "__main__":
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--num_beams", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=128)
+    parser.add_argument("--flowcut", type=bool, default=False)
+    parser.add_argument("--visionzip", type=bool, default=True)
+    # parser.add_argument("--tokenselector-bin-path", type=str, default="/home/weiliu/student/xhm/LLaVA/checkpoints/llava-v1.5-7b-mix665k_shuffled-lambda0.01-sn50-2e-2-mode0/checkpoint-400/token_selector.bin")
+    parser.add_argument("--tokenselector-bin-path", type=str, default=None)
+    parser.add_argument("--tokenselector-k", type=int, default=64)
     args = parser.parse_args()
 
     eval_model(args)

@@ -13,6 +13,7 @@ from llava.mm_utils import tokenizer_image_token, process_images, get_model_name
 
 from PIL import Image
 import math
+from transformers import AutoTokenizer
 
 
 def split_list(lst, n):
@@ -26,18 +27,38 @@ def get_chunk(lst, n, k):
     return chunks[k]
 
 
-def eval_model(args):
+def eval_model(args, my_model=None):
     # Model
     disable_torch_init()
     model_path = os.path.expanduser(args.model_path)
     model_name = get_model_name_from_path(model_path)
-    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
 
+    if my_model is not None:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+        model = my_model
+        vision_tower = model.get_vision_tower()
+        image_processor = vision_tower.image_processor
+    else:
+        tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
+        if args.tokenselector_bin_path is not None:
+            import sys
+            sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+            from tokenselector import init_token_selector, load_token_selector
+            init_token_selector(model, mode=0, k=args.tokenselector_k)
+            load_token_selector(model, args.tokenselector_bin_path)
+
+    if getattr(args, "flowcut", None):
+        from flowcut.flowcut import flowcut as fc
+        model = fc(model, target_num=64)
+    
     questions = json.load(open(os.path.expanduser(args.question_file), "r"))
+    if getattr(args, "eval_q_num", None):
+        questions = questions[:args.eval_q_num]
     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
     answers_file = os.path.expanduser(args.answers_file)
     os.makedirs(os.path.dirname(answers_file), exist_ok=True)
     ans_file = open(answers_file, "w")
+    model.eval()
     for i, line in enumerate(tqdm(questions)):
         idx = line["id"]
         question = line['conversations'][0]
@@ -48,7 +69,7 @@ def eval_model(args):
             image_file = line["image"]
             image = Image.open(os.path.join(args.image_folder, image_file))
             image_tensor = process_images([image], image_processor, model.config)[0]
-            images = image_tensor.unsqueeze(0).half().cuda()
+            images = image_tensor.unsqueeze(0).cuda().to(dtype=model.dtype)
             image_sizes = [image.size]
             if getattr(model.config, 'mm_use_im_start_end', False):
                 qs = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + qs
@@ -106,6 +127,9 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--answer-prompter", action="store_true")
     parser.add_argument("--single-pred-prompt", action="store_true")
+    parser.add_argument("--tokenselector-bin-path", type=str, default=None)
+    parser.add_argument("--tokenselector-k", type=int, default=64)
+    parser.add_argument("--flowcut", type=bool, default=False)
     args = parser.parse_args()
 
     eval_model(args)

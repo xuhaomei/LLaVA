@@ -10,6 +10,7 @@ from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_S
 from llava.conversation import conv_templates, SeparatorStyle
 from llava.model.builder import load_pretrained_model
 from llava.utils import disable_torch_init
+from transformers import AutoTokenizer
 from llava.mm_utils import tokenizer_image_token, process_images, load_image_from_base64, get_model_name_from_path
 
 from PIL import Image
@@ -51,14 +52,29 @@ def get_options(row, options):
     return parsed_options
 
 
-def eval_model(args):
+def eval_model(args, my_model=None):
     # Model
     disable_torch_init()
     model_path = os.path.expanduser(args.model_path)
     model_name = get_model_name_from_path(model_path)
-    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
+
+    if my_model is not None:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+        model = my_model
+        vision_tower = model.get_vision_tower()
+        image_processor = vision_tower.image_processor
+    else:
+        tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
+        if args.tokenselector_bin_path is not None:
+            import sys
+            sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+            from tokenselector import init_token_selector, load_token_selector
+            init_token_selector(model, mode=0, k=args.tokenselector_k)
+            load_token_selector(model, args.tokenselector_bin_path)
 
     questions = pd.read_table(os.path.expanduser(args.question_file))
+    if getattr(args, "eval_q_num", None):
+        questions = questions[:args.eval_q_num]
     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
     answers_file = os.path.expanduser(args.answers_file)
     os.makedirs(os.path.dirname(answers_file), exist_ok=True)
@@ -68,6 +84,7 @@ def eval_model(args):
         args.conv_mode = args.conv_mode + '_mmtag'
         print(f'It seems that this is a plain model, but it is not using a mmtag prompt, auto switching to {args.conv_mode}.')
 
+    model.eval()
     for index, row in tqdm(questions.iterrows(), total=len(questions)):
         options = get_options(row, all_options)
         cur_option_char = all_options[:len(options)]
@@ -110,7 +127,7 @@ def eval_model(args):
             with torch.inference_mode():
                 output_ids = model.generate(
                     input_ids,
-                    images=image_tensor.unsqueeze(0).half().cuda(),
+                    images=image_tensor.unsqueeze(0).cuda().to(dtype=model.dtype),
                     image_sizes=[image.size],
                     do_sample=True if args.temperature > 0 else False,
                     temperature=args.temperature,
@@ -154,6 +171,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_beams", type=int, default=1)
     parser.add_argument("--all-rounds", action="store_true")
     parser.add_argument("--single-pred-prompt", action="store_true")
+    parser.add_argument("--tokenselector-bin-path", type=str, default=None)
+    parser.add_argument("--tokenselector-k", type=int, default=64)
     parser.add_argument("--lang", type=str, default="en")
     args = parser.parse_args()
 

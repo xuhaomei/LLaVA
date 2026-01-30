@@ -8,8 +8,8 @@ from llava.eval.m4c_evaluator import TextVQAAccuracyEvaluator
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--annotation-file', type=str)
-    parser.add_argument('--result-file', type=str)
+    parser.add_argument('--annotation-file', type=str, default="/home/weiliu/student/xhm/LLaVA/playground/data/eval/textvqa/TextVQA_0.5.1_val.json")
+    parser.add_argument('--result-file', type=str, default="/home/weiliu/student/xhm/LLaVA/playground/data/eval/textvqa/answers/llava-v1.5-7b-mix665k_shuffled-lambda0.01-sn50-2e-2-mode0-checkpoint-0.jsonl")
     parser.add_argument('--result-dir', type=str)
     return parser.parse_args()
 
@@ -32,12 +32,15 @@ def prompt_processor(prompt):
     return question.lower()
 
 
-def eval_single(annotation_file, result_file):
+def eval_single(annotation_file, result_file, eval_q_num=None):
     experiment_name = os.path.splitext(os.path.basename(result_file))[0]
     print(experiment_name)
     annotations = json.load(open(annotation_file))['data']
-    annotations = {(annotation['image_id'], annotation['question'].lower()): annotation for annotation in annotations}
     results = [json.loads(line) for line in open(result_file)]
+    if eval_q_num is not None:
+        annotations = annotations[:eval_q_num]
+        results = results[:eval_q_num]
+    annotations = {(annotation['image_id'], annotation['question'].lower()): annotation for annotation in annotations}
 
     pred_list = []
     for result in results:
@@ -48,7 +51,9 @@ def eval_single(annotation_file, result_file):
         })
 
     evaluator = TextVQAAccuracyEvaluator()
-    print('Samples: {}\nAccuracy: {:.2f}%\n'.format(len(pred_list), 100. * evaluator.eval_pred_list(pred_list)))
+    acc = 100. * evaluator.eval_pred_list(pred_list)
+    print('Samples: {}\nAccuracy: {:.2f}%\n'.format(len(pred_list), acc))
+    return acc
 
 
 if __name__ == "__main__":

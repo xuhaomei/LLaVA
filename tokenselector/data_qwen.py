@@ -89,7 +89,7 @@ def preprocess_qwen_2_visual(
     sources,
     tokenizer: transformers.PreTrainedTokenizer,
     grid_thw_image: List = [],
-    grid_thw_video: List = [],
+    grid_thw_video: List = []
 ) -> Dict:
     roles = {"human": "user", "gpt": "assistant"}
     system_message = "You are a helpful assistant."
@@ -180,7 +180,6 @@ def preprocess_qwen_2_visual(
         labels=targets,
     )
 
-
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
@@ -189,21 +188,7 @@ class LazySupervisedDataset(Dataset):
 
         dataset = data_args.dataset_use.split(",")
         dataset_list = data_list(dataset)
-        rank0_print(f"Loading datasets: {dataset_list}")
-        self.video_max_total_pixels = getattr(
-            data_args, "video_max_total_pixels", 1664 * 28 * 28
-        )
-        self.video_min_total_pixels = getattr(
-            data_args, "video_min_total_pixels", 256 * 28 * 28
-        )
-        self.model_type = data_args.model_type
-        if data_args.model_type == "qwen2.5vl":
-            self.get_rope_index = get_rope_index_25
-        else:
-            self.get_rope_index = get_rope_index_2
-
         list_data_dict = []
-
         for data in dataset_list:
             file_format = data["annotation_path"].split(".")[-1]
             if file_format == "jsonl":
@@ -225,6 +210,17 @@ class LazySupervisedDataset(Dataset):
         rank0_print(f"Total training samples: {len(list_data_dict)}")
 
         random.shuffle(list_data_dict)  # Randomly shuffle the data for training
+        self.video_max_total_pixels = getattr(
+            data_args, "video_max_total_pixels", 1664 * 28 * 28
+        )
+        self.video_min_total_pixels = getattr(
+            data_args, "video_min_total_pixels", 256 * 28 * 28
+        )
+        self.model_type = data_args.model_type
+        if data_args.model_type == "qwen2.5vl":
+            self.get_rope_index = get_rope_index_25
+        else:
+            self.get_rope_index = get_rope_index_2
 
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
@@ -364,39 +360,8 @@ class LazySupervisedDataset(Dataset):
         return video_tensor, grid_thw, second_per_grid_ts
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        num_base_retries = 3
-        num_final_retries = 30
-
-        # try the current sample first
-        for attempt_idx in range(num_base_retries):
-            try:
-                sample = self._get_item(i)
-                return sample
-            except Exception as e:
-                # sleep 1s in case it is a cloud disk issue
-                print(f"[Try #{attempt_idx}] Failed to fetch sample {i}. Exception:", e)
-                time.sleep(1)
-
-        # try other samples, in case it is file corruption issue
-        for attempt_idx in range(num_base_retries):
-            try:
-                next_index = min(i + 1, len(self.list_data_dict) - 1)
-                # sample_idx = random.choice(range(len(self)))
-                sample = self._get_item(next_index)
-                return sample
-            except Exception as e:
-                # no need to sleep
-                print(
-                    f"[Try other #{attempt_idx}] Failed to fetch sample {next_index}. Exception:",
-                    e,
-                )
-                pass
-
-        try:
-            sample = self._get_item(i)
-            return sample
-        except Exception as e:
-            raise e
+        sample = self._get_item(i)
+        return sample
 
     def _get_item(self, i) -> Dict[str, torch.Tensor]:
         sources = self.list_data_dict[i]
@@ -410,11 +375,10 @@ class LazySupervisedDataset(Dataset):
         grid_thw = None
         video_grid_thw = None
         second_per_grid_ts = None
-        # print(sources[0])
         has_image = "image" in sources[0] and sources[0]["image"] is not None
         has_video = "video" in sources[0] and sources[0]["video"] is not None
         if has_image:
-            image_folder = self.list_data_dict[i]["data_path"]
+            image_folder = self.data_args.image_folder
             image_file = self.list_data_dict[i]["image"]
             if isinstance(image_file, List):
                 if len(image_file) > 1:
@@ -442,7 +406,7 @@ class LazySupervisedDataset(Dataset):
             ]
         if has_video:
             video_file = self.list_data_dict[i]["video"]
-            video_folder = self.list_data_dict[i]["data_path"]
+            video_folder = self.data_args.video_folder
             if isinstance(video_file, List):
                 if len(video_file) > 1:
                     video_file = [
@@ -488,12 +452,8 @@ class LazySupervisedDataset(Dataset):
             second_per_grid_ts=second_per_grid_ts if second_per_grid_ts else None,
         )
         if not has_image and not has_video:
-            # print(sources[0])
             grid_thw_merged = None
             sources = copy.deepcopy([e["conversations"] for e in sources])
-            # data_dict = preprocess_qwen_2_visual(
-            #     sources, self.tokenizer, grid_thw=grid_thw_merged
-            # )
             data_dict = preprocess_qwen_2_visual(
                 sources, self.tokenizer
             )

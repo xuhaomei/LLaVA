@@ -7,8 +7,7 @@ from torch.nn import CrossEntropyLoss
 from .utils import gumbel_top_k, bernoulli_sample, multinomial_sample
 
 from transformers.utils import (
-    is_flash_attn_2_available,
-    logging,
+    is_flash_attn_2_available
 )
 
 if is_flash_attn_2_available():
@@ -24,11 +23,247 @@ if is_flash_attn_2_available():
     from transformers.modeling_flash_attention_utils import _flash_attention_forward
 else:
     flash_attn_varlen_func = None
-logger = logging.get_logger(__name__)
+from .rope2d import get_rope_index_25
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLCausalLMOutputWithPast
 
 
-def qwen25vl_tokenselector_vision_tower_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+def _get_llm_vision_token_count(grid_thw: torch.Tensor, spatial_merge_size: int) -> int:
+    return int(grid_thw[0].item() * (grid_thw[1].item() // spatial_merge_size) * (grid_thw[2].item() // spatial_merge_size))
+
+
+def _count_media_per_sample(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    vision_start_token_id: int,
+    media_token_id: int,
+) -> List[int]:
+    media_counts = []
+    valid_segments = _get_valid_token_segments(input_ids, attention_mask)
+    packed_row = 0 if _is_cu_seqlens_attention_mask(attention_mask, input_ids) else None
+
+    for batch_idx, valid_positions in enumerate(valid_segments):
+        current_row = packed_row if packed_row is not None else batch_idx
+        valid_tokens = input_ids[current_row][valid_positions]
+        vision_start_indices = torch.argwhere(valid_tokens == vision_start_token_id).squeeze(1)
+        if vision_start_indices.numel() == 0:
+            media_counts.append(0)
+            continue
+        next_token_indices = vision_start_indices + 1
+        next_token_indices = next_token_indices[next_token_indices < valid_tokens.size(0)]
+        media_counts.append((valid_tokens[next_token_indices] == media_token_id).sum().item())
+    return media_counts
+
+
+def _pad_and_stack_1d(sequences: List[torch.Tensor], padding_value: int) -> torch.Tensor:
+    return torch.nn.utils.rnn.pad_sequence(sequences, batch_first=True, padding_value=padding_value)
+
+
+def _pad_and_stack_position_ids(sequences: List[torch.Tensor], padding_value: int = 1) -> torch.Tensor:
+    max_len = max(seq.size(-1) for seq in sequences)
+    output = sequences[0].new_full((sequences[0].size(0), len(sequences), max_len), padding_value)
+    for batch_idx, seq in enumerate(sequences):
+        output[:, batch_idx, : seq.size(-1)] = seq
+    return output
+
+
+def _is_cu_seqlens_attention_mask(attention_mask: Optional[torch.Tensor], input_ids: torch.Tensor) -> bool:
+    return (
+        attention_mask is not None
+        and attention_mask.ndim == 1
+        and input_ids.size(0) == 1
+        and attention_mask.numel() >= 2
+        and attention_mask[0].item() == 0
+    )
+
+
+def _get_valid_token_segments(input_ids: torch.Tensor, attention_mask: torch.Tensor) -> List[torch.Tensor]:
+    if _is_cu_seqlens_attention_mask(attention_mask, input_ids):
+        return [
+            torch.arange(
+                attention_mask[idx].item(),
+                attention_mask[idx + 1].item(),
+                device=input_ids.device,
+                dtype=torch.long,
+            )
+            for idx in range(attention_mask.size(0) - 1)
+        ]
+
+    return [
+        torch.nonzero(attention_mask[batch_idx] == 1, as_tuple=False).squeeze(1)
+        for batch_idx in range(input_ids.size(0))
+    ]
+
+
+def _prune_media_tokens(
+    self,
+    input_ids: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    labels: Optional[torch.Tensor],
+    position_ids: Optional[torch.Tensor],
+    media_grid_thw: Optional[torch.Tensor],
+    keep_indices_list: Optional[List[torch.Tensor]],
+    media_token_id: int,
+):
+    if media_grid_thw is None or keep_indices_list is None:
+        return input_ids, attention_mask, labels, position_ids
+
+    if len(keep_indices_list) == 0:
+        return input_ids, attention_mask, labels, position_ids
+
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=input_ids.device)
+    else:
+        attention_mask = attention_mask.to(input_ids.device)
+    is_packed = _is_cu_seqlens_attention_mask(attention_mask, input_ids)
+
+    spatial_merge_size = self.config.vision_config.spatial_merge_size
+    media_counts = _count_media_per_sample(
+        input_ids,
+        attention_mask,
+        self.config.vision_start_token_id,
+        media_token_id,
+    )
+
+    seq_keep_indices = []
+    media_offset = 0
+    valid_segments = _get_valid_token_segments(input_ids, attention_mask)
+    for batch_idx, valid_positions in enumerate(valid_segments):
+        current_row = 0 if is_packed else batch_idx
+        valid_tokens = input_ids[current_row][valid_positions]
+        valid_keep_mask = torch.ones(valid_tokens.size(0), dtype=torch.bool, device=input_ids.device)
+        media_positions = torch.nonzero(valid_tokens == media_token_id, as_tuple=False).squeeze(1)
+
+        media_cursor = 0
+        for local_media_idx in range(media_counts[batch_idx]):
+            global_media_idx = media_offset + local_media_idx
+            media_token_count = _get_llm_vision_token_count(media_grid_thw[global_media_idx], spatial_merge_size)
+            cur_positions = media_positions[media_cursor : media_cursor + media_token_count]
+            if cur_positions.numel() != media_token_count:
+                raise ValueError(
+                    f"Media token count mismatch for batch {batch_idx}: expected {media_token_count}, got {cur_positions.numel()}"
+                )
+
+            cur_keep_indices = keep_indices_list[global_media_idx].to(device=input_ids.device, dtype=torch.long)
+            if cur_keep_indices.numel() == 0:
+                raise ValueError(f"Media token selector kept zero tokens for batch {batch_idx}, media {global_media_idx}")
+            if cur_keep_indices.max().item() >= media_token_count or cur_keep_indices.min().item() < 0:
+                raise ValueError(
+                    f"Media keep indices out of range for batch {batch_idx}, media {global_media_idx}: "
+                    f"max={cur_keep_indices.max().item()}, token_count={media_token_count}"
+                )
+
+            valid_keep_mask[cur_positions] = False
+            valid_keep_mask[cur_positions[cur_keep_indices]] = True
+            media_cursor += media_token_count
+
+        if media_cursor != media_positions.numel():
+            raise ValueError(
+                f"Unused media tokens remain in batch {batch_idx}: used {media_cursor}, total {media_positions.numel()}"
+            )
+
+        seq_keep_indices.append(valid_positions[valid_keep_mask])
+        media_offset += media_counts[batch_idx]
+
+    if media_offset != len(keep_indices_list):
+        raise ValueError(f"Media keep metadata mismatch: consumed {media_offset}, expected {len(keep_indices_list)}")
+
+    if is_packed:
+        input_ids = torch.cat([input_ids[0, keep_idx] for keep_idx in seq_keep_indices], dim=0).unsqueeze(0)
+        kept_seq_lens = torch.tensor(
+            [keep_idx.size(0) for keep_idx in seq_keep_indices],
+            dtype=attention_mask.dtype,
+            device=attention_mask.device,
+        )
+        attention_mask = torch.cat([attention_mask.new_zeros(1), kept_seq_lens.cumsum(dim=0)], dim=0)
+
+        if labels is not None:
+            labels = torch.cat([labels[0, keep_idx] for keep_idx in seq_keep_indices], dim=0).unsqueeze(0)
+
+        if position_ids is not None:
+            if position_ids.ndim == 3:
+                position_ids = torch.cat(
+                    [position_ids[:, 0, keep_idx] for keep_idx in seq_keep_indices], dim=-1
+                ).unsqueeze(1)
+            elif position_ids.ndim == 2:
+                position_ids = torch.cat([position_ids[0, keep_idx] for keep_idx in seq_keep_indices], dim=0).unsqueeze(0)
+            else:
+                raise ValueError(f"Unsupported position_ids ndim: {position_ids.ndim}")
+    else:
+        pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else 0
+        input_ids = _pad_and_stack_1d([input_ids[idx, keep_idx] for idx, keep_idx in enumerate(seq_keep_indices)], pad_token_id)
+        attention_mask = _pad_and_stack_1d(
+            [attention_mask[idx, keep_idx].new_ones(keep_idx.size(0)) for idx, keep_idx in enumerate(seq_keep_indices)],
+            0,
+        )
+
+        if labels is not None:
+            labels = _pad_and_stack_1d([labels[idx, keep_idx] for idx, keep_idx in enumerate(seq_keep_indices)], -100)
+
+        if position_ids is not None:
+            if position_ids.ndim == 3:
+                position_ids = _pad_and_stack_position_ids(
+                    [position_ids[:, idx, keep_idx] for idx, keep_idx in enumerate(seq_keep_indices)]
+                )
+            elif position_ids.ndim == 2:
+                position_ids = _pad_and_stack_1d(
+                    [position_ids[idx, keep_idx] for idx, keep_idx in enumerate(seq_keep_indices)],
+                    1,
+                )
+            else:
+                raise ValueError(f"Unsupported position_ids ndim: {position_ids.ndim}")
+
+    return input_ids, attention_mask.to(torch.int32), labels, position_ids
+
+
+def _compute_per_sample_causal_lm_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    vocab_size: int,
+    ignore_index: int = -100,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    loss_fct = CrossEntropyLoss(reduction="none", ignore_index=ignore_index)
+
+    if _is_cu_seqlens_attention_mask(attention_mask, labels):
+        cu_seqlens = attention_mask.to(device=logits.device, dtype=torch.long)
+        per_sample_losses = []
+
+        for idx in range(cu_seqlens.numel() - 1):
+            start = cu_seqlens[idx].item()
+            end = cu_seqlens[idx + 1].item()
+
+            if end - start <= 1:
+                per_sample_losses.append(logits.new_zeros(()))
+                continue
+
+            sample_shift_logits = logits[:, start : end - 1, :].contiguous().view(-1, vocab_size)
+            sample_shift_labels = labels[:, start + 1 : end].contiguous().view(-1).to(logits.device)
+            sample_token_loss = loss_fct(sample_shift_logits, sample_shift_labels)
+            valid_mask = sample_shift_labels != ignore_index
+
+            if valid_mask.any():
+                per_sample_losses.append(sample_token_loss[valid_mask].mean())
+            else:
+                per_sample_losses.append(logits.new_zeros(()))
+
+        my_loss = torch.stack(per_sample_losses, dim=0)
+        loss = my_loss.mean()
+        return loss, my_loss
+
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous().to(logits.device)
+    token_loss = loss_fct(
+        shift_logits.view(-1, vocab_size),
+        shift_labels.view(-1),
+    ).view_as(shift_labels)
+    valid_mask = shift_labels != ignore_index
+    valid_token_count = valid_mask.sum(dim=-1).clamp_min(1)
+    my_loss = (token_loss * valid_mask).sum(dim=-1) / valid_token_count
+    loss = my_loss.mean()
+    return loss, my_loss
+
+
+def qwen25vl_tokenselector_vision_tower_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor):
     """
     Args:
         hidden_states (`torch.Tensor` of shape `(seq_len, hidden_size)`):
@@ -85,53 +320,54 @@ def qwen25vl_tokenselector_vision_tower_forward(self, hidden_states: torch.Tenso
     reverse_indices = torch.argsort(window_index)
     hidden_states = hidden_states[reverse_indices, :]
 
-    # ---------------------------add---------------------------------------------
-    k = int(hidden_states.size(0) * self.keep_ratio)
+    # ---------------------------add start---------------------------------------------
+    num_images_or_videos = grid_thw.size(0)
     hidden_states = hidden_states.unsqueeze(0)
     logits = self.token_selector(hidden_states)
-    if self.training:
-        if self.mode == 0:
-            print(">>>> We will sample tokens with gumbel-top-k. <<<<")
-            mask, log_probs = gumbel_top_k(logits, k)
-            row_idx = torch.arange(mask.size(0)).unsqueeze(1).repeat(1, k).to(mask.device)
-            col_idx = torch.stack([torch.where(mask[i])[0] for i in range(mask.size(0))])
-            hidden_states_new = hidden_states[row_idx, col_idx]
-        elif self.mode == 1:
-            print(">>>> We will sample tokens with Bernoulli. <<<<")
-            assert logits.size(0) == 1, "Bernoulli sample is NOT avaliable when batch_size > 1."
-            mask, log_probs = bernoulli_sample(logits, k)
-            hidden_states_new = hidden_states[:, mask.squeeze().int(), :]
-        elif self.mode == 2:
-            print(">>>> We will sample tokens with torch.multinomial. <<<<")
-            mask, log_probs = multinomial_sample(logits, k)
-            row_idx = torch.arange(mask.size(0)).unsqueeze(1).repeat(1, k)
-            col_idx = torch.stack([torch.where(mask[i])[0] for i in range(mask.size(0))])
-            hidden_states_new = hidden_states[row_idx, col_idx]
+    hidden_states_new_list = []
+    log_probs_list = []
+    keep_indices_list = []
+    for i in range(num_images_or_videos):
+        cur_logits = logits[:,cu_seqlens[i]//self.spatial_merge_unit:cu_seqlens[i+1]//self.spatial_merge_unit, :]
+        cur_hidden_states = hidden_states[:,cu_seqlens[i]//self.spatial_merge_unit:cu_seqlens[i+1]//self.spatial_merge_unit, :]
+        cur_logits_len = cur_logits.size(1)
+        k = int(cur_logits_len * self.keep_ratio)
+        k = max(1, min(cur_logits_len, k))
+        if self.training:
+            if self.mode == 0:
+                mask, log_probs = gumbel_top_k(cur_logits, k)
+                row_idx = torch.arange(mask.size(0)).unsqueeze(1).repeat(1, k).to(mask.device)
+                col_idx = torch.stack([torch.where(mask[i])[0].sort().values for i in range(mask.size(0))])
+                hidden_states_new = cur_hidden_states[row_idx, col_idx]
+                log_probs_list.append(log_probs[0])
+            elif self.mode == 1:
+                assert cur_logits.size(0) == 1, "Bernoulli sample is NOT avaliable when batch_size > 1."
+                mask, log_probs = bernoulli_sample(cur_logits, k)
+                col_idx = torch.where(mask.squeeze(0).squeeze(-1).bool())[0].sort().values
+                hidden_states_new = cur_hidden_states[:, col_idx, :]
+                log_probs_list.append(log_probs[0])
+            elif self.mode == 2:
+                mask, log_probs = multinomial_sample(cur_logits, k)
+                row_idx = torch.arange(mask.size(0)).unsqueeze(1).repeat(1, k).to(mask.device)
+                col_idx = torch.stack([torch.where(mask[i])[0].sort().values for i in range(mask.size(0))])
+                hidden_states_new = cur_hidden_states[row_idx, col_idx]
+                log_probs_list.append(log_probs[0])
+            else:
+                raise NotImplementedError("Mode:3 is not implemented. Please check your config.")
         else:
-            raise NotImplementedError("Mode:3 is not implemented. Please check your config.")
-    else:
-        _, topk_idx = logits.squeeze(-1).topk(k, dim=-1)
-        mask = torch.zeros_like(logits.squeeze(-1))
-        mask = mask.scatter(1, topk_idx, 1)
-        row_idx = torch.arange(mask.size(0)).unsqueeze(1).repeat(1, k).to(mask.device)
-        col_idx = topk_idx
-        image_features = image_features[row_idx, col_idx]
-        log_probs = None
-    # hidden_states_unsqueezed = hidden_states.unsqueeze(0)
-    # learned_scores = self.importance_scorer(hidden_states_unsqueezed).squeeze(0)
-    # total_tokens = learned_scores.shape[0]
-    # k = int(total_tokens * self.budgets)
-    # img_mask = topk(learned_scores.unsqueeze(0), k).squeeze(0)
-    # img_mask_expanded = img_mask.unsqueeze(1).expand(-1, hidden_states_unsqueezed.shape[-1])
-    # hidden_states_new = img_mask_expanded*hidden_states
-    # hidden_states_new = hidden_states_new.type(hidden_states.dtype)
-
-    # with torch.no_grad():
-    #     constraint_topk_indices = learned_scores.topk(k, dim=0).indices
-    #     constraint_img_mask = torch.zeros_like(learned_scores, device=learned_scores.device)
-    #     constraint_img_mask.scatter_(dim=-1, index=constraint_topk_indices, value=1.0)
-    # -------------------------------------------------------------------------------
-    return hidden_states_new.squeeze(0), log_probs, mask
+            _, topk_idx = cur_logits.squeeze(-1).topk(k, dim=-1)
+            row_idx = torch.arange(topk_idx.size(0)).unsqueeze(1).repeat(1, k).to(topk_idx.device)
+            col_idx = topk_idx.sort(dim=-1).values
+            hidden_states_new = cur_hidden_states[row_idx, col_idx]
+            log_probs = None
+        keep_indices_list.append(col_idx.squeeze(0))
+        hidden_states_new_list.append(hidden_states_new.squeeze(0))
+    hidden_states_new = torch.cat(hidden_states_new_list, dim=0)
+    log_probs = torch.stack(log_probs_list, dim=0).unsqueeze(0) if self.training else None
+    if getattr(self, "eval_policy_entropy", False):
+        return logits, num_images_or_videos, cu_seqlens
+    return hidden_states_new, log_probs, {"keep_indices": keep_indices_list}
+    # ---------------------------add end---------------------------------------------
 
 
 
@@ -161,19 +397,78 @@ def qwen25vl_tokenselector_generation_forward(
     )
     return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+    original_input_ids = input_ids
+    original_attention_mask = attention_mask
+
     if inputs_embeds is None:
-        inputs_embeds = self.model.embed_tokens(input_ids)
+        # For the prefill stage, multimodal RoPE must be computed on the original sequence.
+        # After that, we prune tokens and prune position_ids with the same keep indices.
+        if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
+            if (
+                (cache_position is not None and cache_position[0] == 0)
+                or self.rope_deltas is None
+                or (past_key_values is None or past_key_values.get_seq_length() == 0)
+            ):
+                position_ids, rope_deltas = get_rope_index_25(
+                    self.config.vision_config.spatial_merge_size,
+                    original_input_ids,
+                    image_grid_thw,
+                    video_grid_thw,
+                    second_per_grid_ts,
+                    original_attention_mask,
+                )
+                self.rope_deltas = rope_deltas
+
+        image_selector_outputs = None
+        video_selector_outputs = None
+        selector_log_probs = []
         if pixel_values is not None:
             pixel_values = pixel_values.type(self.visual.dtype)
+            image_embeds, image_log_probs, image_selector_outputs = self.visual(pixel_values, grid_thw=image_grid_thw)
+            if image_log_probs is not None:
+                selector_log_probs.append(image_log_probs)
 
-            # ------------- change start --------------------------------
-            image_embeds, log_probs, _ = self.visual(pixel_values, grid_thw=image_grid_thw)
+        if pixel_values_videos is not None:
+            pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
+            video_embeds, video_log_probs, video_selector_outputs = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
+            if video_log_probs is not None:
+                selector_log_probs.append(video_log_probs)
+
+        if image_selector_outputs is not None:
+            input_ids, attention_mask, labels, position_ids = _prune_media_tokens(
+                self,
+                input_ids,
+                attention_mask,
+                labels,
+                position_ids,
+                image_grid_thw,
+                image_selector_outputs.get("keep_indices"),
+                self.config.image_token_id,
+            )
+
+        if video_selector_outputs is not None:
+            input_ids, attention_mask, labels, position_ids = _prune_media_tokens(
+                self,
+                input_ids,
+                attention_mask,
+                labels,
+                position_ids,
+                video_grid_thw,
+                video_selector_outputs.get("keep_indices"),
+                self.config.video_token_id,
+            )
+
+        inputs_embeds = self.model.embed_tokens(input_ids)
+
+        if pixel_values is not None:
             n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
             n_image_features = image_embeds.shape[0]
-            # if n_image_tokens != n_image_features:
-            #     raise ValueError(
-            #         f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
-            #     )
+
+            if n_image_tokens != n_image_features:
+                raise ValueError(
+                    f"Image features and image tokens do not match after pruning: "
+                    f"tokens: {n_image_tokens}, features {n_image_features}"
+                )
 
             mask = input_ids == self.config.image_token_id
             mask_unsqueezed = mask.unsqueeze(-1)
@@ -182,19 +477,15 @@ def qwen25vl_tokenselector_generation_forward(
 
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
-            # ------------- change end --------------------------------
 
         if pixel_values_videos is not None:
-            pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
-            # ------------- change start --------------------------------
-            video_embeds, log_probs, _ = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
-            # ------------- change end --------------------------------
             n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
             n_video_features = video_embeds.shape[0]
-            # if n_video_tokens != n_video_features:
-            #     raise ValueError(
-            #         f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
-            #     )
+            if n_video_tokens != n_video_features:
+                raise ValueError(
+                    f"Video features and video tokens do not match after pruning: "
+                    f"tokens: {n_video_tokens}, features {n_video_features}"
+                )
 
             mask = input_ids == self.config.video_token_id
             mask_unsqueezed = mask.unsqueeze(-1)
@@ -206,24 +497,31 @@ def qwen25vl_tokenselector_generation_forward(
 
         if attention_mask is not None:
             attention_mask = attention_mask.to(inputs_embeds.device)
+    else:
+        selector_log_probs = []
 
-    # if we get 4D attention mask we cannot calculate rope deltas anymore. TODO @raushan fixme
+    if self.training:
+        log_probs = torch.cat(selector_log_probs, dim=-1) if len(selector_log_probs) > 0 else None
+    else:
+        log_probs = None
+
+    # Decode steps do not carry visual tokens anymore, so position_ids are derived from
+    # cache_position and the cached rope_deltas from the prefill stage.
     if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
-        # calculate RoPE index once per generation in the pre-fill stage only
         if (
             (cache_position is not None and cache_position[0] == 0)
             or self.rope_deltas is None
             or (past_key_values is None or past_key_values.get_seq_length() == 0)
         ):
-            position_ids, rope_deltas = self.get_rope_index(
-                input_ids,
+            position_ids, rope_deltas = get_rope_index_25(
+                self.config.vision_config.spatial_merge_size,
+                original_input_ids,
                 image_grid_thw,
                 video_grid_thw,
                 second_per_grid_ts,
-                attention_mask,
+                original_attention_mask,
             )
             self.rope_deltas = rope_deltas
-        # then use the prev pre-calculated rope-deltas to get the correct position ids
         else:
             batch_size, seq_length, _ = inputs_embeds.shape
             delta = (
@@ -233,7 +531,7 @@ def qwen25vl_tokenselector_generation_forward(
             )
             position_ids = torch.arange(seq_length, device=inputs_embeds.device)
             position_ids = position_ids.view(1, -1).expand(batch_size, -1)
-            if cache_position is not None:  # otherwise `deltas` is an int `0`
+            if cache_position is not None:
                 delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=0)
             position_ids = position_ids.add(delta)
             position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
@@ -258,21 +556,12 @@ def qwen25vl_tokenselector_generation_forward(
     if labels is not None:
         # Upcast to float if we need to compute the loss to avoid potential precision issues
         logits = logits.float()
-        # Shift so that tokens < n predict n
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        # Flatten the tokens
-        loss_fct = CrossEntropyLoss()
-        shift_logits = shift_logits.view(-1, self.config.vocab_size)
-        shift_labels = shift_labels.view(-1)
-        # Enable model parallelism
-        shift_labels = shift_labels.to(shift_logits.device)
-        loss = loss_fct(shift_logits, shift_labels)
-        # -------------add--------------------------------
-        if self.training:
-            loss_fct_2 = CrossEntropyLoss(reduction="none")
-            my_loss = loss_fct_2(shift_logits, shift_labels)
-            my_loss = my_loss.reshape(outputs["logits"].size(0),-1).mean(-1)
+        loss, my_loss = _compute_per_sample_causal_lm_loss(
+            logits,
+            labels,
+            attention_mask,
+            self.config.vocab_size,
+        )
 
     if not return_dict:
         output = (logits,) + outputs[1:]
@@ -286,12 +575,10 @@ def qwen25vl_tokenselector_generation_forward(
         attentions=outputs.attentions,
         rope_deltas=self.rope_deltas,
     )
-    # ------------- change start --------------------------------
     if self.training:
         return output, my_loss, log_probs
     else:
         return output
-    # ------------- change end --------------------------------
 
 def _flash_attention_forward(
     query_states: torch.Tensor,

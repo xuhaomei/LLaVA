@@ -3,7 +3,7 @@ import torch
 from .llava_arch import encode_images, prepare_inputs_labels_for_multimodal
 from .llava_llama import llava_tokenselector_forward
 import types
-# from .qwen_selector import replace_qwen2_vl_attention_class, qwen25vl_tokenselector_vision_tower_forward, qwen25vl_tokenselector_generation_forward
+from .qwen_selector import replace_qwen2_vl_attention_class, qwen25vl_tokenselector_vision_tower_forward, qwen25vl_tokenselector_generation_forward
 
 def init_token_selector(model, mode=0, k=64):
     model.mode = mode
@@ -31,10 +31,12 @@ def load_token_selector(model, tokenselector_bin_path):
 
 def init_token_selector_qwen(model, mode=0, keep_ratio=0.1):
     replace_qwen2_vl_attention_class()
+    model.mode = mode
+    model.keep_ratio = keep_ratio
     model.visual.mode = mode
     model.visual.keep_ratio = keep_ratio
     model.visual.forward = types.MethodType(qwen25vl_tokenselector_vision_tower_forward, model.visual)
-    model.visual.token_selector = nn.Linear(3584, 1, dtype=model.dtype, bias=False)
+    model.visual.token_selector = nn.Linear(3584, 1, dtype=model.dtype, bias=False, device=model.device)
     nn.init.normal_(model.visual.token_selector.weight, std=0.001)
     model.forward = types.MethodType(qwen25vl_tokenselector_generation_forward, model)
     return model

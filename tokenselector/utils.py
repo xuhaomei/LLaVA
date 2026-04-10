@@ -43,3 +43,26 @@ def gumbel_top_k(logits, K):
     log_prob_total = log_prob.gather(1, topk_idx).sum(-1)
 
     return actions, log_prob_total
+
+def split_by_mask(input_ids, mask):
+    # 去掉 batch 维
+    input_ids = input_ids.squeeze(0)
+    mask = mask.squeeze(0)
+
+    # 找 True 的索引
+    true_indices = torch.nonzero(mask, as_tuple=False).squeeze(1)
+
+    if true_indices.numel() == 0:
+        return []
+
+    # 找连续段的分界点
+    # 当相邻索引差 > 1 时说明断开
+    splits = torch.where(true_indices[1:] - true_indices[:-1] > 1)[0] + 1
+
+    # 按分界点切分
+    segments = torch.split(true_indices, splits.tolist())
+
+    # 用索引取回 input_ids
+    result = [input_ids[idx] for idx in segments]
+
+    return result

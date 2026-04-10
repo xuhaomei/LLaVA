@@ -60,11 +60,11 @@ class QwenTokenSelectorTrainer(Trainer):
             else:
                 reward = - ce_loss.detach()
             log_probs = outputs_tuple[2] 
-            reward_list.append(reward)
-            log_probs_list.append(log_probs)
             if log_probs is None:
                 has_no_image = True
                 break
+            reward_list.append(reward)
+            log_probs_list.append(log_probs.squeeze()) # (B,)
 
         if has_no_image:
             loss = torch.tensor(0.0, device=model.device, requires_grad=False)
@@ -78,35 +78,6 @@ class QwenTokenSelectorTrainer(Trainer):
         loss = - (log_probs_list * reward_list).mean() * alpha
 
         return (loss, outputs) if return_outputs else loss
-
-    def evaluate(
-        self,
-        eval_dataset = None,
-        ignore_keys = None,
-        metric_key_prefix: str = "eval",
-    ):
-        # memory metrics - must set up as early as possible
-        self._memory_tracker.start()
-        model_path = os.path.join(self.args.output_dir, f"step-{self.state.global_step}")
-        ckpt = model_path.split('/')[-2] + '-' + model_path.split('/')[-1]
-        self.model.eval()
-        mme_acc = eval_mme(ckpt, self.model)
-        pope_acc = eval_pope(ckpt, self.model)
-        scienceqa_acc = eval_scienceqa(ckpt, self.model)
-        gqa_acc = eval_gqa(ckpt, self.model)
-        textvqa_acc = eval_textvqa(ckpt, self.model)
-        metrics = {
-            "textvqa_acc": float(textvqa_acc),
-            "gqa_acc": float(gqa_acc),
-            "scienceqa_acc": float(scienceqa_acc),
-            "pope_acc": float(pope_acc),
-            "mme_acc": float(mme_acc)
-        }
-        self.log(metrics)
-        self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
-        self._memory_tracker.stop_and_update_metrics(metrics)
-        self.model.train()
-        return {}
     
     def _save_checkpoint(self, model, trial, metrics=None):
         from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR

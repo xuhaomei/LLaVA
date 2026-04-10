@@ -46,12 +46,14 @@ class ModelArguments:
     tune_mm_mlp: bool = field(default=False)
     tune_mm_vision: bool = field(default=False)
     tune_selector: bool = field(default=False)
-    gumbel_start_tau: float = field(default=1.0, metadata={"help": "Starting value for gumbel_tau"})
-    gumbel_end_tau: float = field(default=0.1, metadata={"help": "Ending value for gumbel_tau"})
 
 @dataclass
 class DataArguments:
+    data_path: str = field(default=None,
+                           metadata={"help": "Path to the training data."})
     dataset_use: str = field(default="")
+    image_folder: Optional[str] = field(default=None)
+    video_folder: Optional[str] = field(default=None)
     video_max_frames: Optional[int] = field(default=8)
     video_min_frames: Optional[int] = field(default=4)
     data_flatten: bool = field(default=False)
@@ -143,8 +145,7 @@ def train(attn_implementation="flash_attention_2"):
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
             attn_implementation=attn_implementation,
-            torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-            device_map="auto"
+            torch_dtype=(torch.bfloat16 if training_args.bf16 else None)
         )
         data_args.image_processor = AutoProcessor.from_pretrained(
             model_args.model_name_or_path,
@@ -191,8 +192,7 @@ def train(attn_implementation="flash_attention_2"):
         print("="*80)
     # -----------------------------------
     
-    data_module = make_qwen_supervised_data_module(tokenizer=tokenizer, data_args=data_args)    
-    data_module['eval_dataset'] = data_module['train_dataset']  # For quick eval during token selector training
+    data_module = make_qwen_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
     trainer = QwenTokenSelectorTrainer(
         model=model,
         processing_class=tokenizer,

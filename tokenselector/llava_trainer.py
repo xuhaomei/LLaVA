@@ -1,6 +1,7 @@
 from llava.train.llava_trainer import LLaVATrainer
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 from transformers.trainer import Trainer
+from transformers.modeling_utils import unwrap_model
 import torch
 import os
 from torch.nn import CrossEntropyLoss
@@ -26,21 +27,12 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
     return to_return
 
 class LLaVATokenSelectorTrainer(LLaVATrainer):
-    def create_optimizer(self):
-        """
-        Setup the optimizer.
-        This method is nearly identical to the one in Trainer, but only optimizes
-        the token selector parameters.
-        """
-        optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
-        self.optimizer = optimizer_cls(self.model.model.token_selector.parameters(), **optimizer_kwargs)
-
-        return self.optimizer
     
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         reward_list = []
         log_probs_list = []
         has_no_image = False
+        model = unwrap_model(model)
         for _ in range(self.args.sample_num):
             outputs_tuple = model(**inputs)
             outputs = outputs_tuple[0]  # Get the main output
@@ -166,11 +158,11 @@ class LLaVATokenSelectorTrainer(LLaVATrainer):
 
         # Only save Selector
         keys_to_match = ['token_selector']
-
-        weight_to_save = get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), keys_to_match)
+        model = unwrap_model(model)
+        weight_to_save = get_mm_adapter_state_maybe_zero_3(model.named_parameters(), keys_to_match)
 
         if self.args.local_rank == 0 or self.args.local_rank == -1:
-            self.model.config.save_pretrained(output_dir)
+            model.config.save_pretrained(output_dir)
             torch.save(weight_to_save, os.path.join(output_dir, "token_selector.bin"))
 
     def _save(self, output_dir=None, state_dict=None):

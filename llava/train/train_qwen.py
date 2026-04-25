@@ -179,8 +179,8 @@ def train(attn_implementation="flash_attention_2"):
 
     # --- print trainable parameters ---
     if local_rank == 0: 
-        print("="*80)
-        print("Printing trainable parameters...")
+        rank0_print("="*80)
+        rank0_print("Printing trainable parameters...")
         trainable_param_names = []
         
         for name, param in model.named_parameters():
@@ -188,8 +188,8 @@ def train(attn_implementation="flash_attention_2"):
                 trainable_param_names.append(name)
         
         for name in trainable_param_names:
-            print(f"- {name}")
-        print("="*80)
+            rank0_print(f"- {name}")
+        rank0_print("="*80)
     # -----------------------------------
     
     data_module = make_qwen_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
@@ -199,6 +199,12 @@ def train(attn_implementation="flash_attention_2"):
         args=training_args,
         **data_module
     )
+    train_dataloader = trainer.get_train_dataloader()
+
+    if trainer.is_world_process_zero():
+        print("len(train_dataset) = ", len(data_module['train_dataset']))
+        print("len(train_dataloader) =", len(train_dataloader))
+
     trainer.train()
     trainer.save_state()
     data_args.image_processor.save_pretrained(training_args.output_dir)
